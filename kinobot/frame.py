@@ -35,6 +35,14 @@ from kinobot.playhouse.lyric_card import make_card
 from . import request_trace
 from .bracket import Bracket
 from .config import config
+from .frameops import aspect_crop_box
+from .frameops import display_dimensions
+from .frameops import normalize_position
+from .frameops import prepare_frame_flags
+from .frameops import quote_origin
+from .frameops import CORNER_MAX_W
+from .frameops import rewrap_text
+from .frameops import zoom_geometry
 from .constants import CACHED_FRAMES_DIR
 from .constants import FRAMES_DIR
 from .constants import IMAGE_EXTENSION
@@ -362,6 +370,8 @@ class PostProc(BaseModel):
     text_shadow_stroke: int = 2
     text_shadow_font_plus: int = 0
     zoom_factor: Optional[float] = None
+    zoom_corner: Optional[str] = None
+    text_position: Optional[str] = None
     flip: Optional[str] = None
     no_collage_resize: bool = False
     static_title: Optional[str] = None
@@ -579,8 +589,12 @@ class PostProc(BaseModel):
             self.frame.pil = instance.enhance(value)
 
         # Fixme
-        if config_["zoom_factor"]:
-            self.frame.pil = _zoom_img(self.frame.pil, config_["zoom_factor"])
+        zoom = config_.get("zoom_factor")
+        corner = config_.get("zoom_corner")
+        if corner and not zoom:
+            zoom = 2.0
+        if zoom:
+            self.frame.pil = _zoom_img(self.frame.pil, zoom, corner)
 
         self.frame.pil = self._mirror_image(self.frame.pil, config_.get("flip"))
 
@@ -602,6 +616,9 @@ class PostProc(BaseModel):
                 wrap_width=config_.get("wrap_width"),
                 text_lines=config_.get("text_lines"),
             )
+            position = normalize_position(config_.get("text_position"))
+            if position in ("tl", "tr", "bl", "br") and not config_.get("text_xy"):
+                quote = _fit_corner_quote(self.frame.pil, quote, **config_)
             self.frame.finished_quote = quote
 
             _draw_quote(self.frame.pil, quote, **config_)
@@ -623,13 +640,16 @@ class PostProc(BaseModel):
             x_off = self.frame.bracket.postproc.x_crop_offset
             y_off = self.frame.bracket.postproc.y_crop_offset
 
-            self.frame.pil = _crop_by_threshold(
-                self.frame.pil,
-                self.aspect_quotient,
-                x_off=x_off,
-                y_off=y_off,
-                custom_crop=custom_crop,
-            )
+            try:
+                self.frame.pil = _crop_by_threshold(
+                    self.frame.pil,
+                    self.aspect_quotient,
+                    x_off=x_off,
+                    y_off=y_off,
+                    custom_crop=custom_crop,
+                )
+            except ValueError as error:
+                raise exceptions.InvalidRequest(str(error)) from None
 
     @staticmethod
     def _handle_paste(frame: Frame):
@@ -694,6 +714,32 @@ class PostProc(BaseModel):
 
         return val
 
+    @validator("zoom_corner")
+    @classmethod
+    def _check_zoom_corner(cls, val):
+        if val is None:
+            return None
+        spot = str(val).strip().lower()
+        if spot not in ("tl", "tr", "bl", "br"):
+            raise exceptions.InvalidRequest("Pick one corner: --tl, --tr, --bl or --br.")
+        return spot
+
+    @validator("text_position")
+    @classmethod
+    def _check_text_position(cls, val):
+        if val is None:
+            return None
+        if val is True:
+            raise exceptions.InvalidRequest(
+                "--position needs a value: TL, TR, BL, BR, TC, C or BC."
+            )
+        spot = normalize_position(val)
+        if spot is None:
+            raise exceptions.InvalidRequest(
+                "--position: use TL, TR, BL, BR, TC, C or BC."
+            )
+        return spot
+
     @validator(
         "contrast", "brightness", "color", "sharpness", "font_size", "palette_height"
     )
@@ -718,7 +764,7 @@ class PostProc(BaseModel):
         if val is None:
             return None
 
-        if 1 > val < 2.5:
+        if val < 1 or val > 2.5:
             raise exceptions.InvalidRequest(f"Expected 1>|<2.5, found {val}")
 
         return val
@@ -895,7 +941,9 @@ class Static:
         self._paths = []
 
         try:
-            self.postproc = PostProc(**kwargs)
+            self.postproc = PostProc(**prepare_frame_flags(kwargs))
+        except ValueError as error:
+            raise exceptions.InvalidRequest(str(error)) from None
         except ValidationError as error:
             raise exceptions.InvalidRequest(error) from None
 
@@ -1263,53 +1311,15 @@ def _scaled_crop(image: Image.Image, custom_crop, no_scale):
 def _crop_by_threshold(
     image: Image.Image, threshold: float = 1.65, **kwargs
 ) -> Image.Image:
-    width, height = image.size
-    init_w, init_h = width, height
-    quotient = width / height
-    inc = 0
-    limit = 500
-
-    while True:
-        inc += 1
-        if quotient > threshold:
-            width -= 7
-            quotient = (width - (init_w - width)) / init_h
-            crop_tuple = (init_w - width, 0, width, init_h)
-        else:
-            height -= 7
-            off = init_h - height
-            quotient = init_w / (init_h - off)
-            crop_tuple = (0, off / 2, init_w, init_h - (off / 2))
-
-        if abs(quotient - threshold) < 0.03:
-            crop_tuple = list(crop_tuple)
-
-            # Doing the logic here to avoid making operations on every loop
-            if kwargs.get("x_off"):
-                total_removed = crop_tuple[0]
-                offset = total_removed * (kwargs["x_off"] / 100)
-                crop_tuple[0], crop_tuple[2] = (
-                    crop_tuple[0] + offset,
-                    crop_tuple[2] + offset,
-                )
-
-            if kwargs.get("y_off"):
-                total_removed = crop_tuple[1]
-                offset = total_removed * (kwargs["y_off"] / 100)
-                crop_tuple[1], crop_tuple[3] = (
-                    crop_tuple[1] - offset,
-                    crop_tuple[3] - offset,
-                )
-
-            crop_tuple = tuple(crop_tuple)
-            logger.debug("Final quotient and crop tuple: %s - %s", quotient, crop_tuple)
-            logger.debug("Total loops: %d", inc)
-            return image.crop(crop_tuple)
-
-        if inc > limit:
-            raise NotImplementedError(
-                f"An infinite loop was prevented: {init_w}/{init_w}"
-            )
+    box = aspect_crop_box(
+        image.size[0],
+        image.size[1],
+        threshold,
+        x_off=kwargs.get("x_off") or 0,
+        y_off=kwargs.get("y_off") or 0,
+    )
+    logger.debug("Aspect crop box: %s", box)
+    return image.crop(box)
 
 
 def _scale_from_100(box: list, width: int, height: int) -> tuple:
@@ -1359,16 +1369,43 @@ def _homogenize_images(images: List[Image.Image]) -> list:
 def _fix_dar(cv2_image, dar: float):
     """
     Fix aspect ratio from cv2 image array.
+
+    shape is (height, width). The display width is height * DAR, same as
+    scale=iw*sar:ih, so square-pixel frames are left alone.
     """
     logger.debug("Fixing image with DAR: %s", dar)
+    height, width = cv2_image.shape[:2]
+    display_w, display_h = display_dimensions(width, height, dar)
+    if (display_w, display_h) == (width, height):
+        return cv2_image
+    return cv2.resize(cv2_image, (display_w, display_h))
 
-    width, height = cv2_image.shape[:2]
 
-    # fix width
-    fixed_aspect = dar / (width / height)
-    width = int(width * fixed_aspect)
-    # resize with fixed width (cv2)
-    return cv2.resize(cv2_image, (width, height))
+def _fit_corner_quote(image: Image.Image, quote: str, **kwargs) -> str:
+    """Rewrap a caption that would run past a side or corner spot."""
+    font_path = FONTS_DICT.get(kwargs.get("font", "")) or _DEFAULT_FONT
+    scale = kwargs.get("font_size", 27.5) * 0.001
+    font_size = int((image.size[0] * scale) + (image.size[1] * scale))
+    try:
+        font = ImageFont.truetype(font_path, font_size)
+    except OSError:
+        return quote
+    draw = ImageDraw.Draw(image)
+
+    def _widest(text):
+        return max(
+            (_measure_text(draw, line, font)[0] for line in text.split("\n")),
+            default=0,
+        )
+
+    if _widest(quote) <= CORNER_MAX_W * image.size[0]:
+        return quote
+    fitted = quote
+    for ratio in (0.6, 0.45, 0.34):
+        fitted = rewrap_text(quote, ratio)
+        if _widest(fitted) <= CORNER_MAX_W * image.size[0]:
+            break
+    return fitted
 
 
 def _draw_quote(image: Image.Image, quote: str, modify_text: bool = True, **kwargs):
@@ -1376,11 +1413,22 @@ def _draw_quote(image: Image.Image, quote: str, modify_text: bool = True, **kwar
     font_size = int((image.size[0] * scale) + (image.size[1] * scale))
     logger.debug("Guessed font size: %s", font_size)
     y_offset = kwargs.get("y_offset", 15)
+    position = normalize_position(kwargs.get("text_position")) or "bc"
+    kwargs["text_position"] = position
 
-    lines_count = len(quote.split("\n"))
+    lines = quote.split("\n")
+    lines_count = len(lines)
 
-    if lines_count > 1:
-        text_height = _get_text_height(image, quote.split("\n")[0], **kwargs)
+    if (
+        position == "c"
+        and not kwargs.get("text_xy")
+        and kwargs.get("block_top") is None
+    ):
+        kwargs["block_top"] = max(0, (image.size[1] - font_size * lines_count) // 2)
+
+    # Bottom-anchored captions still grow upward. Top and centre place the block themselves.
+    if lines_count > 1 and position in ("bc", "bl", "br"):
+        text_height = _get_text_height(image, lines[0], **kwargs)
         to_add = _get_percentage_of(text_height, image.size[1]) * lines_count
 
         new_y_offset = y_offset + ((to_add / lines_count) * (lines_count - 1))
@@ -1391,8 +1439,16 @@ def _draw_quote(image: Image.Image, quote: str, modify_text: bool = True, **kwar
 
     plus_y = 0
 
-    for line in quote.split("\n"):
+    for line in lines:
         plus_y += __draw_quote(image, line, plus_y=plus_y, **kwargs)
+
+
+def _measure_text(draw, quote, font):
+    """Width and height of one line. textbbox includes the stroke-less glyph box."""
+    if hasattr(draw, "textbbox"):
+        box = draw.textbbox((0, 0), quote, font=font)
+        return box[2] - box[0], box[3] - box[1]
+    return draw.textsize(quote, font)  # type: ignore
 
 
 def _get_text_height(image, quote, **kwargs):
@@ -1406,7 +1462,7 @@ def _get_text_height(image, quote, **kwargs):
     font_size = int((width * scale) + (height * scale))
     font = ImageFont.truetype(font, font_size)
 
-    _, txt_h = draw.textsize(quote, font)  # type: ignore
+    _, txt_h = _measure_text(draw, quote, font)
     return txt_h
 
 
@@ -1423,7 +1479,7 @@ def _get_text_area_box(image, quote, **kwargs):
 
     off = _get_percentage(kwargs.get("y_offset", 15), height)
 
-    txt_w, txt_h = draw.textsize(quote, font)  # type: ignore
+    txt_w, txt_h = _measure_text(draw, quote, font)
     txt_h = font_size
 
     draw_h = height - txt_h - off
@@ -1480,15 +1536,35 @@ def __draw_quote(image: Image.Image, quote: str, plus_y=0, **kwargs):
     off = _get_percentage(kwargs.get("y_offset", 15), height)
     logger.debug("Offset: %s", off)
 
-    txt_w, txt_h = draw.textsize(quote, font)
+    txt_w, txt_h = _measure_text(draw, quote, font)
     txt_h = font_size
 
     draw_h = height - txt_h - off
+    position = kwargs.get("text_position") or "bc"
+    if kwargs.get("text_xy"):
+        origin = None
+    else:
+        origin = quote_origin(
+            width,
+            height,
+            txt_w,
+            txt_h,
+            y_offset=kwargs.get("y_offset", 15),
+            align=kwargs.get("text_align", "center"),
+            position=position,
+            plus_y=plus_y,
+            block_top=kwargs.get("block_top"),
+        )
     if kwargs.get("text_background"):
         kwargs["stroke_width"] = 0
-        x = (width - txt_w) / 2
-        div = draw_h * 0.033  # IDK
-        y = draw_h + div
+        if origin is not None:
+            x, y_line = origin
+        elif text_xy:
+            x, y_line = text_xy[0], text_xy[1] + plus_y
+        else:
+            x, y_line = (width - txt_w) / 2, draw_h + plus_y
+        div = font_size * 0.033
+        y = y_line + div
         box = (x, y - div, x + txt_w, y + txt_h)
         draw.rectangle(box, fill=kwargs["text_background"])
 
@@ -1504,10 +1580,12 @@ def __draw_quote(image: Image.Image, quote: str, plus_y=0, **kwargs):
         offset = [int(i) for i in kwargs.get("text_shadow_offset", (5, 5))]
 
         stroke_width = int(kwargs.get("text_shadow_stroke", 2))
-        if not text_xy:
-            box_ = (((width - txt_w) / 2) + offset[0], draw_h + offset[1] + plus_y)
-        else:
+        if text_xy:
             box_ = text_xy[0] + offset[0], text_xy[1] + offset[1] + plus_y
+        elif origin is not None:
+            box_ = origin[0] + offset[0], origin[1] + offset[1]
+        else:
+            box_ = (((width - txt_w) / 2) + offset[0], draw_h + offset[1] + plus_y)
 
         draw_1.text(
             box_,
@@ -1528,10 +1606,12 @@ def __draw_quote(image: Image.Image, quote: str, plus_y=0, **kwargs):
 
         image.paste(blurred, blurred)
 
-    if not text_xy:
-        draw_box = (width - txt_w) / 2, draw_h + plus_y
-    else:
+    if text_xy:
         draw_box = text_xy[0], text_xy[1] + plus_y
+    elif origin is not None:
+        draw_box = origin
+    else:
+        draw_box = (width - txt_w) / 2, draw_h + plus_y
 
     draw.text(
         # ((width - txt_w) / 2, draw_h),
@@ -1818,19 +1898,9 @@ class Collage:
         return ImageOps.expand(image, border=box, fill=self._color)
 
 
-def _zoom_img(img: Image.Image, zoom_factor=1.3):
-    width, height = img.size
-
-    new_width = int(width * zoom_factor)
-    new_height = int(height * zoom_factor)
-
-    resized_img = img.resize((new_width, new_height))
-
-    x = int((new_width - width) / 2)
-    y = int((new_height - height) / 2)
-
-    cropped_img = resized_img.crop((x, y, x + width, y + height))
-    return cropped_img
+def _zoom_img(img: Image.Image, zoom_factor=1.3, corner=None):
+    resized, box = zoom_geometry(img.size[0], img.size[1], zoom_factor, corner)
+    return img.resize(resized).crop(box)
 
 
 def _get_from_image_url(url: str):
