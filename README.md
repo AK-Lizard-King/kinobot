@@ -5,6 +5,10 @@
 
 Welcome to the source code of `kinobot`. This code is provided with the purpose of being reused or modified in other projects or analyzed for better understanding.
 
+## Setup
+
+Copy `config.example.py` to `config.py`, then fill it in. `config.py` is gitignored.
+
 ## Fork additions
 
 This repository is a fork of [vitiko98/kinobot](https://github.com/vitiko98/kinobot) by Vitiko. The original project stays under GPL-3.0, and Vitiko's copyright in `LICENSE` is unchanged.
