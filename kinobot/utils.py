@@ -104,16 +104,18 @@ def get_args_and_clean(content: str, args: tuple = ()) -> Tuple[str, dict]:
     """
     matches = _ARGS_RE.findall(content.strip())
     result = {}
+    allowed = {item.lower(): item for item in args}
     for match in matches:
         logger.debug("Match: %s", match)
+        canon = allowed.get(match[0].lower())
 
-        if match[0] not in args:
+        if canon is None:
             close = process.extract(match[0], args, limit=1)[0][0]
             raise InvalidRequest(
                 f"Invalid flag: `{match[0]}`. Maybe you meant `{close}`?"
             )
 
-        match_ = match[0].lstrip("-").replace("-", "_")
+        match_ = canon.lstrip("-").replace("-", "_")
 
         if not match[1]:
             content = content.replace(match[0], "")

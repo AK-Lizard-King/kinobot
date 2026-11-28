@@ -22,6 +22,8 @@ FONTS_DIR = config.fonts_dir
 
 import kinobot.exceptions as exceptions
 
+from .frameops import normalize_position
+from .frameops import prepare_frame_flags
 from .utils import get_args_and_clean
 from .utils import normalize_request_str
 
@@ -115,6 +117,8 @@ class _ProcBase(BaseModel):
     text_shadow_stroke: int = 2
     text_shadow_font_plus: int = 0
     zoom_factor: Optional[float] = None
+    zoom_corner: Optional[str] = None
+    text_position: Optional[str] = None
     wrap_width: Optional[int] = None
     tint: Optional[str] = None
     tint_alpha: float = 0.5
@@ -219,6 +223,32 @@ class _ProcBase(BaseModel):
             raise exceptions.InvalidRequest("Choose between 1 and 4")
 
         return val
+
+    @validator("zoom_corner")
+    @classmethod
+    def _check_zoom_corner(cls, val):
+        if val is None:
+            return None
+        spot = str(val).strip().lower()
+        if spot not in ("tl", "tr", "bl", "br"):
+            raise exceptions.InvalidRequest("Pick one corner: --tl, --tr, --bl or --br.")
+        return spot
+
+    @validator("text_position")
+    @classmethod
+    def _check_text_position(cls, val):
+        if val is None:
+            return None
+        if val is True:
+            raise exceptions.InvalidRequest(
+                "--position needs a value: TL, TR, BL, BR, TC, C or BC."
+            )
+        spot = normalize_position(val)
+        if spot is None:
+            raise exceptions.InvalidRequest(
+                "--position: use TL, TR, BL, BR, TC, C or BC."
+            )
+        return spot
 
     @validator("font")
     @classmethod
@@ -431,6 +461,11 @@ class Bracket:
         "--text-shadow-blur",
         "--text-shadow-font-plus",
         "--zoom-factor",
+        "--tl",
+        "--tr",
+        "--bl",
+        "--br",
+        "--position",
         "--debug",
         "--debug-color",
         "--text-xy",
@@ -599,7 +634,9 @@ class Bracket:
         self._content, args = get_args_and_clean(self._content, self.__args_tuple__)
         logger.debug("OG Content: %s", self._content)
         try:
-            self.postproc = BracketPostProc(**args)
+            self.postproc = BracketPostProc(**prepare_frame_flags(args))
+        except ValueError as error:
+            raise exceptions.InvalidRequest(str(error)) from None
         except ValidationError as error:
             raise exceptions.InvalidRequest(error) from None
 

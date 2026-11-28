@@ -34,6 +34,10 @@ import kinobot.exceptions as exceptions
 
 from .cache import region
 from .config import config
+from .frameops import display_dimensions
+from .tonemap import build_extract_args
+from .tonemap import ffmpeg_caps
+from .tonemap import looks_hdr
 from .constants import CACHED_FRAMES_DIR
 from .constants import FANART_BASE
 from .constants import LOGOS_DIR
@@ -256,58 +260,79 @@ class LocalMedia(Kinobase):
 
                 if use_dar:
                     logger.debug("Fixing dar (%s)", dar_)
-                    width, height = array.shape[:2]
-
-                    fixed_aspect = dar_ / (width / height)
-                    width = int(width * fixed_aspect)
-                    return cv2.resize(array, (width, height))
+                    height, width = array.shape[:2]
+                    display_w, display_h = display_dimensions(width, height, dar_)
+                    if (display_w, display_h) != (width, height):
+                        return cv2.resize(array, (display_w, display_h))
 
                 return array
             except StopIteration:
                 raise exceptions.InexistentTimestamp(f"{timestamps} not found in video")
 
     def _get_frame_ffmpeg(self, timestamps: Tuple[int, int]):
+        return self._extract_still(timestamps, "scale=iw*sar:ih")
+
+    def _extract_still(self, timestamps: Tuple[int, int], tail: str):
         ffmpeg_ts = ".".join(str(int(ts)) for ts in timestamps)
         path = os.path.join(tempfile.gettempdir(), f"kinobot_{uuid.uuid4()}.png")
 
         if not os.path.isfile(self.path):
             raise FileNotFoundError(self.path)
 
-        command = [
-            "ffmpeg",
-            "-y",
-            "-v",
-            "quiet",
-            "-stats",
-            "-ss",
-            ffmpeg_ts,
-            "-i",
-            self.path,
-            "-vf",
-            "scale=iw*sar:ih",
-            "-vframes",
-            "1",
-            path,
-        ]
+        hdr, transfer = looks_hdr(self.path)
+        caps = ffmpeg_caps() if hdr else {}
+        timed_out = False
+        try:
+            frame = self._grab_ffmpeg_frame(
+                ffmpeg_ts, path, hdr=hdr, caps=caps, transfer=transfer, tail=tail
+            )
+        except exceptions.KinoUnwantedException:
+            if not hdr:
+                raise
+            timed_out = True
+            frame = None
+        if frame is None and hdr:
+            logger.warning(
+                "HDR tone map %s for %s; grabbing the frame without it",
+                "timed out" if timed_out else "failed",
+                self.path,
+            )
+            if os.path.isfile(path):
+                os.remove(path)
+            frame = self._grab_ffmpeg_frame(
+                ffmpeg_ts, path, hdr=False, caps={}, transfer=None, tail=tail
+            )
+        if frame is not None:
+            return frame
+        if os.path.isfile(path):
+            os.remove(path)
+        raise exceptions.InexistentTimestamp(
+            f"Internal error extracting '{timestamps}'"
+        )
 
+    def _grab_ffmpeg_frame(self, ffmpeg_ts, path, hdr, caps, transfer, tail=None):
+        command = build_extract_args(
+            self.path,
+            ffmpeg_ts,
+            path,
+            hdr=hdr,
+            caps=caps,
+            transfer=transfer,
+            tail=tail or "scale=iw*sar:ih",
+        )
         logger.debug("Command to run: %s", " ".join(command))
         try:
             subprocess.run(command, timeout=EXTRACTION_TIMEOUT)
         except subprocess.TimeoutExpired as error:
             raise exceptions.KinoUnwantedException("Subprocess error") from error
-
-        if os.path.isfile(path):
-            frame = cv2.imread(path)
-            os.remove(path)
-            if frame is not None:
-                logger.debug("OK")
-                return frame
-
-            raise exceptions.InexistentTimestamp(f"`{timestamps}` timestamp not found")
-
-        raise exceptions.InexistentTimestamp(
-            f"Internal error extracting '{timestamps}'"
-        )
+        if not os.path.isfile(path):
+            return None
+        frame = cv2.imread(path)
+        os.remove(path)
+        if frame is not None:
+            logger.debug("OK")
+            return frame
+        return None
 
     def load_capture_and_fps(self):  # Still public for GIFs
         logger.info("Loading OpenCV capture and FPS for %s", self.path)
@@ -317,15 +342,15 @@ class LocalMedia(Kinobase):
     def _fix_dar(self, cv2_image):
         """
         Fix aspect ratio from cv2 image array.
+
+        OpenCV's shape is (height, width). Display width is height * DAR.
         """
         logger.debug("Fixing image with DAR: %s", self._dar)
-
-        width, height = cv2_image.shape[:2]
-
-        # fix width
-        fixed_aspect = self._dar / (width / height)
-        width = int(width * fixed_aspect)
-        return cv2.resize(cv2_image, (width, height))
+        height, width = cv2_image.shape[:2]
+        display_w, display_h = display_dimensions(width, height, self._dar)
+        if (display_w, display_h) == (width, height):
+            return cv2_image
+        return cv2.resize(cv2_image, (display_w, display_h))
 
     def _get_insert_command(self) -> str:
         columns = ",".join(self.__insertables__)
@@ -1325,46 +1350,8 @@ class EpisodeAlt(Episode):
 
 class RawEmbeddedSubtitles(Episode):
     def _get_frame_ffmpeg(self, timestamps: Tuple[int, int]):
-        ffmpeg_ts = ".".join(str(int(ts)) for ts in timestamps)
-        path = os.path.join(tempfile.gettempdir(), f"kinobot_{uuid.uuid4()}.png")
-
-        command = [
-            "ffmpeg",
-            "-i",
-            self.path,
-            "-y",
-            # "-v",
-            # "quiet",
-            "-stats",
-            "-ss",
-            ffmpeg_ts,
-            "-vf",
-            "scale=iw*sar:ih",
-            "-vf",
-            f"subtitles='{self.path}',scale=iw*sar:ih",
-            "-vframes",
-            "1",
-            path,
-        ]
-
-        logger.debug("Command to run: %s", " ".join(command))
-        try:
-            subprocess.run(command, timeout=EXTRACTION_TIMEOUT)
-        except subprocess.TimeoutExpired as error:
-            raise exceptions.KinoUnwantedException("Subprocess error") from error
-
-        if os.path.isfile(path):
-            frame = cv2.imread(path)
-            os.remove(path)
-            if frame is not None:
-                logger.debug("OK")
-                return frame
-
-            raise exceptions.InexistentTimestamp(f"`{timestamps}` timestamp not found")
-
-        raise exceptions.InexistentTimestamp(
-            f"Internal error extracting '{timestamps}'"
-        )
+        tail = "subtitles='%s',scale=iw*sar:ih" % self.path
+        return self._extract_still(timestamps, tail)
 
 
 class ExternalMedia(Kinobase):

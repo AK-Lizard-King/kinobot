@@ -17,6 +17,7 @@ import kinobot.exceptions as exceptions
 from .bracket import Bracket
 from .constants import LANGUAGE_SUFFIXES
 from .media import hints
+from .quote_match import pick_quote
 from .utils import normalize_request_str
 
 _MERGE_PATTERN = re.compile(r"\...|\-")
@@ -175,6 +176,15 @@ class RequestItem:
         :raises exceptions.InvalidRequest
         """
         logger.debug("Looking for the quote: %s", quote)
+        contents = [sub.content for sub in self._subtitles]
+        index, cleaned, error = pick_quote(quote, contents)
+        if error:
+            raise exceptions.QuoteNotFound(error)
+        if index is not None:
+            logger.info("Quote match: %s", contents[index])
+            return self._subtitles[index]
+        if cleaned and cleaned != quote:
+            quote = cleaned
 
         for sub in self._subtitles:
             if normalize_request_str(quote, False) == normalize_request_str(
